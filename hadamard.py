@@ -1,24 +1,11 @@
+import time
+
 import numpy as np
 import torch
-
-use_hadamard_transform_cuda = True
-try:
-    import hadamard_cuda
-    # import torch.utils.cpp_extension
-    # hadamard_cuda = torch.utils.cpp_extension.load(
-    #     name='hadamard_cuda',
-    #     sources=[
-    #         'hadamard_cuda/hadamard_cuda.cpp',
-    #         'hadamard_cuda/hadamard_cuda_kernel.cu',
-    #     ],
-    #     extra_cuda_cflags=['-O2'],
-    #     verbose=False
-    #     )
-except (ImportError, RuntimeError) as e:
-    print("CUDA version of Hadamard transform isn't installed. Will use Pytorch's version, which is much slower.")
-    use_hadamard_transform_cuda = False
-
 from scipy.linalg import hadamard
+
+import hadamard_cuda
+
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -72,24 +59,31 @@ def hadamard_transform_cuda(u, normalize=False):
 def test_hadamard_transform():
     m = 14
     n = 1 << m
-    batch_size = 50
-    u = torch.rand((batch_size, n), requires_grad=True, device=device)
+    batch_size = 1 << 12
+    u = torch.rand((batch_size, n), dtype=torch.float16, requires_grad=True, device=device)
+
+    start = time.perf_counter()
     result_cuda = hadamard_transform_cuda(u)
     grad_cuda, = torch.autograd.grad(result_cuda.sum(), u, retain_graph=True)
+    print("Elapsed: ", time.perf_counter() - start)
+
+    start = time.perf_counter()
     result_torch = hadamard_transform_torch(u)
     grad_torch, = torch.autograd.grad(result_torch.sum(), u, retain_graph=True)
+    print("Elapsed: ", time.perf_counter() - start)
+
     # Explicit construction from scipy
-    H = torch.tensor(hadamard(n), dtype=torch.float, device=device)
+    H = torch.tensor(hadamard(n), dtype=torch.float16, device=device)
     result_explicit = u @ H.t()
-    print((result_cuda - result_explicit).abs().max().item())
-    print((result_cuda - result_explicit).abs().mean().item())
-    print((result_torch - result_explicit).abs().max().item())
-    print((result_torch - result_explicit).abs().mean().item())
-    print((grad_cuda - grad_torch).abs().max().item())
-    print((grad_cuda - grad_torch).abs().mean().item())
+    print("[CUDA] L-inf", (result_cuda - result_explicit).abs().max().item())
+    print("[CUDA] L-1", (result_cuda - result_explicit).abs().mean().item())
+    print("[Torch] L-inf", (result_torch - result_explicit).abs().max().item())
+    print("[Torch] L-1", (result_torch - result_explicit).abs().mean().item())
+    print("[Grad] L-inf", (grad_cuda - grad_torch).abs().max().item())
+    print("[Grad] L-1", (grad_cuda - grad_torch).abs().mean().item())
 
 
-hadamard_transform = hadamard_transform_cuda if use_hadamard_transform_cuda else hadamard_transform_torch
+hadamard_transform = hadamard_transform_cuda
 
 if __name__ == '__main__':
     test_hadamard_transform()
