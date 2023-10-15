@@ -30,6 +30,10 @@
 #ifndef fwt_kernel_cuh
 #define fwt_kernel_cuh
 
+#include <ATen/ATen.h>
+#include <ATen/Context.h>
+#include <ATen/cuda/CUDAContext.h>
+
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
 
@@ -140,6 +144,7 @@ __global__ static void fwtBatch2Kernel(__half *d_Output, __half *d_Input, int st
   T = D1;
   D1 = __hadd(D1, D3);
   D3 = __hsub(T, D3);
+
   T = D0;
   d_Dst[i0] = __hadd(D0, D1);
   d_Dst[i1] = __hsub(T, D1);
@@ -149,20 +154,96 @@ __global__ static void fwtBatch2Kernel(__half *d_Output, __half *d_Input, int st
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Single in-global memory radix-8 Fast Walsh Transform pass
+// (for strides exceeding elementary vector size)
+////////////////////////////////////////////////////////////////////////////////
+__global__ static void fwtBatch3Kernel(__half *d_Output, __half *d_Input, int stride) {
+  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+  const int N = blockDim.x * gridDim.x * 8;
+
+  __half *d_Src = d_Input + blockIdx.y * N;
+  __half *d_Dst = d_Output + blockIdx.y * N;
+
+  int lo = pos & (stride - 1);
+  int i0 = ((pos - lo) << 3) + lo;
+  int i1 = i0 + stride;
+  int i2 = i1 + stride;
+  int i3 = i2 + stride;
+  int i4 = i3 + stride;
+  int i5 = i4 + stride;
+  int i6 = i5 + stride;
+  int i7 = i6 + stride;
+
+  __half D0 = d_Src[i0];
+  __half D1 = d_Src[i1];
+  __half D2 = d_Src[i2];
+  __half D3 = d_Src[i3];
+  __half D4 = d_Src[i4];
+  __half D5 = d_Src[i5];
+  __half D6 = d_Src[i6];
+  __half D7 = d_Src[i7];
+
+  __half T;
+  T = D0;
+  D0 = __hadd(D0, D4);
+  D4 = __hsub(T, D4);
+  T = D1;
+  D1 = __hadd(D1, D5);
+  D5 = __hsub(T, D5);
+  T = D2;
+  D2 = __hadd(D2, D6);
+  D6 = __hsub(T, D6);
+  T = D3;
+  D3 = __hadd(D3, D7);
+  D7 = __hsub(T, D7);
+
+  T = D0;
+  __half E0 = __hadd(D0, D2);
+  __half E2 = __hsub(T, D2);
+  T = D1;
+  __half E1 = __hadd(D1, D3);
+  __half E3 = __hsub(T, D3);
+  T = D4;
+  __half E4 = __hadd(D4, D6);
+  __half E6 = __hsub(T, D6);
+  T = D5;
+  __half E5 = __hadd(D5, D7);
+  __half E7 = __hsub(T, D7);
+
+  T = E0;
+  d_Dst[i0] = __hadd(E0, E1);
+  d_Dst[i1] = __hsub(T, E1);
+  T = E2;
+  d_Dst[i2] = __hadd(E2, E3);
+  d_Dst[i3] = __hsub(T, E3);
+  T = E4;
+  d_Dst[i4] = __hadd(E4, E5);
+  d_Dst[i5] = __hsub(T, E5);
+  T = E6;
+  d_Dst[i6] = __hadd(E6, E7);
+  d_Dst[i7] = __hsub(T, E7);
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Put everything together: batched Fast Walsh Transform CPU front-end
 ////////////////////////////////////////////////////////////////////////////////
 extern void fwtBatchGPU(__half *d_Data, int M, int log2N) {
   const int THREAD_N = 256;
 
   int N = 1 << log2N;
-  dim3 grid((1 << log2N) / (4 * THREAD_N), M, 1);
+  dim3 grid((1 << log2N) / (8 * THREAD_N), M, 1);
 
-  for (; log2N > ELEMENTARY_LOG2SIZE; log2N -= 2, N >>= 2, M <<= 2) {
-    fwtBatch2Kernel<<<grid, THREAD_N>>>(d_Data, d_Data, N / 4);
+  for (; log2N > ELEMENTARY_LOG2SIZE; log2N -= 3, N >>= 3, M <<= 3) {
+    fwtBatch3Kernel<<<grid, THREAD_N, 0, at::cuda::getCurrentCUDAStream()>>>(d_Data, d_Data, N / 8);
     getLastCudaError("fwtBatch2Kernel() execution failed\n");
   }
 
-  fwtBatch1Kernel<<<M, N / 4, N * sizeof(__half)>>>(d_Data, d_Data, log2N);
+  for (; log2N > ELEMENTARY_LOG2SIZE; log2N -= 2, N >>= 2, M <<= 2) {
+    fwtBatch2Kernel<<<grid, THREAD_N, 0, at::cuda::getCurrentCUDAStream()>>>(d_Data, d_Data, N / 4);
+    getLastCudaError("fwtBatch2Kernel() execution failed\n");
+  }
+
+  fwtBatch1Kernel<<<M, N / 4, N * sizeof(__half), at::cuda::getCurrentCUDAStream()>>>(d_Data, d_Data, log2N);
   getLastCudaError("fwtBatch1Kernel() execution failed\n");
 }
 
