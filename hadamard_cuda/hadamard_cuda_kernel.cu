@@ -227,23 +227,24 @@ __global__ static void fwtBatch3Kernel(__half *d_Output, __half *d_Input, int st
 ////////////////////////////////////////////////////////////////////////////////
 // Put everything together: batched Fast Walsh Transform CPU front-end
 ////////////////////////////////////////////////////////////////////////////////
-extern void fwtBatchGPU(__half *d_Data, int M, int log2N) {
+__host__ extern void fwtBatchGPU(__half *d_Data, size_t M, int log2N) {
   const int THREAD_N = 256;
+  at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
   int N = 1 << log2N;
   dim3 grid((1 << log2N) / (8 * THREAD_N), M, 1);
 
   for (; log2N > ELEMENTARY_LOG2SIZE; log2N -= 3, N >>= 3, M <<= 3) {
-    fwtBatch3Kernel<<<grid, THREAD_N, 0, at::cuda::getCurrentCUDAStream()>>>(d_Data, d_Data, N / 8);
+    fwtBatch3Kernel<<<grid, THREAD_N, 0, stream>>>(d_Data, d_Data, N / 8);
     getLastCudaError("fwtBatch2Kernel() execution failed\n");
   }
 
   for (; log2N > ELEMENTARY_LOG2SIZE; log2N -= 2, N >>= 2, M <<= 2) {
-    fwtBatch2Kernel<<<grid, THREAD_N, 0, at::cuda::getCurrentCUDAStream()>>>(d_Data, d_Data, N / 4);
+    fwtBatch2Kernel<<<grid, THREAD_N, 0, stream>>>(d_Data, d_Data, N / 4);
     getLastCudaError("fwtBatch2Kernel() execution failed\n");
   }
 
-  fwtBatch1Kernel<<<M, N / 4, N * sizeof(__half), at::cuda::getCurrentCUDAStream()>>>(d_Data, d_Data, log2N);
+  fwtBatch1Kernel<<<M, N / 4, N * sizeof(__half), stream>>>(d_Data, d_Data, log2N);
   getLastCudaError("fwtBatch1Kernel() execution failed\n");
 }
 
@@ -260,7 +261,7 @@ __global__ static void modulateKernel(__half *d_A, __half *d_B, int N) {
 }
 
 // Interface to modulateKernel()
-extern void modulateGPU(__half *d_A, __half *d_B, int N) {
+__host__ extern void modulateGPU(__half *d_A, __half *d_B, int N) {
   modulateKernel<<<128, 256>>>(d_A, d_B, N);
 }
 

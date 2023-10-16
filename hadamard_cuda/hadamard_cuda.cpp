@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 
 
-extern void fwtBatchGPU(half *x, int batchSize, int log2N);
+extern void fwtBatchGPU(half *x, size_t batchSize, int log2N);
 
 torch::Tensor hadamard_transform(torch::Tensor x) {
   TORCH_CHECK(x.device().type() == torch::kCUDA, "x must be a CUDA tensor");

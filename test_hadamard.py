@@ -7,10 +7,11 @@ from hadamard import hadamard_transform_torch, hadamard_transform_cuda
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-class Once:
-    def __init__(self, hadamard_impl, dummy_in):
+class Repeat:
+    def __init__(self, hadamard_impl, dummy_in, times):
         self.hadamard_impl = hadamard_impl
         self.dummy_in = dummy_in
+        self.times = times
 
     def __enter__(self):
         # Warmup
@@ -24,7 +25,8 @@ class Once:
         # Captures the graph
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            self.dummy_in = self.hadamard_impl(self.dummy_in)
+            for _ in range(self.times):
+                self.dummy_in = self.hadamard_impl(self.dummy_in)
 
         return g, self.dummy_in
 
@@ -46,7 +48,7 @@ class Benchmark:
         self.end_event.record()
         torch.cuda.synchronize()
         elapsed_time_ms = self.start_event.elapsed_time(self.end_event)
-        print(f"[{self.name.ljust(5)}] Elapsed: ", elapsed_time_ms)
+        print(f"[{self.name.ljust(16)}] Elapsed: ", elapsed_time_ms)
 
 
 def test_hadamard_transform():
@@ -55,24 +57,34 @@ def test_hadamard_transform():
     batch_size = 1 << 0
     u = torch.rand((batch_size, n), dtype=torch.float16, device=device)
 
-    with Once(hadamard_transform_torch, u) as (g, result):
-        with Benchmark("Torch"):
+    dummy = torch.clone(u)
+    with Benchmark("Torch (loop)"):
+        for _ in range(1024):
+            dummy = hadamard_transform_torch(dummy)
+
+    with Repeat(hadamard_transform_torch, u, 1024) as (g, result):
+        with Benchmark("Torch (graph)"):
             g.replay()
         result_torch = torch.clone(result)
+
+    dummy = torch.clone(u)
+    with Benchmark("CUDA (loop)"):
+        for _ in range(1024):
+            dummy = hadamard_transform_cuda(dummy)
     
-    with Once(hadamard_transform_cuda, u) as (g, result):
-        with Benchmark("CUDA"):
+    with Repeat(hadamard_transform_cuda, u, 1024) as (g, result):
+        with Benchmark("CUDA (graph)"):
             g.replay()
         result_cuda = torch.clone(result)
 
     # Explicit construction from scipy
-    H = torch.tensor(hadamard(n), dtype=torch.float16, device=device)
-    result_explicit = u @ H.t()
-    print("---------")
-    print("[Torch] L-inf", (result_torch - result_explicit).abs().max().item())
-    print("[Torch] L-1", (result_torch - result_explicit).abs().mean().item())
-    print("[CUDA ] L-inf", (result_cuda - result_explicit).abs().max().item())
-    print("[CUDA ] L-1", (result_cuda - result_explicit).abs().mean().item())
+    # H = torch.tensor(hadamard(n), dtype=torch.float16, device=device)
+    # result_explicit = u @ H.t()
+    # print("---------")
+    # print("[Torch] L-inf", (result_torch - result_explicit).abs().max().item())
+    # print("[Torch] L-1", (result_torch - result_explicit).abs().mean().item())
+    # print("[CUDA ] L-inf", (result_cuda - result_explicit).abs().max().item())
+    # print("[CUDA ] L-1", (result_cuda - result_explicit).abs().mean().item())
 
 
 if __name__ == '__main__':
