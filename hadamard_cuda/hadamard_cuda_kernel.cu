@@ -30,14 +30,16 @@
 #ifndef fwt_kernel_cuh
 #define fwt_kernel_cuh
 
+#include <cooperative_groups.h>
+#include <cuda_fp16.h>
+#include "helper_cuda.h"
+
 #include <ATen/ATen.h>
 #include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/Dispatch.h>
+#include <torch/types.h>
 
-#include <cooperative_groups.h>
-#include <cuda_fp16.h>
-
-#include "helper_cuda.h"
 
 namespace cg = cooperative_groups;
 
@@ -45,18 +47,22 @@ namespace cg = cooperative_groups;
 // Elementary(for vectors less than elementary size) in-shared memory
 // combined radix-2 + radix-4 Fast Walsh Transform
 ///////////////////////////////////////////////////////////////////////////////
-#define ELEMENTARY_LOG2SIZE 11
+#define MAX_SMEM_LOG2SIZE 13
 
-__global__ static void fwtBatch1Kernel(__half *d_Output, __half *d_Input, int log2N) {
+
+template <typename scalar_t>
+__global__ static void fwtBatch1Kernel(scalar_t *d_Output, scalar_t *d_Input, int log2N) {
   // Handle to thread block group
   cg::thread_block cta = cg::this_thread_block();
   const int N = 1 << log2N;
   const int base = blockIdx.x << log2N;
 
-  //(2 ** 11) * 4 bytes == 8KB -- maximum s_data[] size for G80
-  extern __shared__ __half s_data[];
-  __half *d_Src = d_Input + base;
-  __half *d_Dst = d_Output + base;
+  // 2 ** 13 bytes == 8KB -- maximum s_data[] size for A6000
+  extern __shared__ __align__(8) unsigned char sdata_raw[];     // align to 8 bytes for double
+  scalar_t *s_data = reinterpret_cast<scalar_t*>(sdata_raw);
+
+  scalar_t *d_Src = d_Input + base;
+  scalar_t *d_Dst = d_Output + base;
 
   for (int pos = threadIdx.x; pos < N; pos += blockDim.x) {
     s_data[pos] = d_Src[pos];
@@ -73,24 +79,24 @@ __global__ static void fwtBatch1Kernel(__half *d_Output, __half *d_Input, int lo
     int i3 = i2 + stride;
 
     cg::sync(cta);
-    __half D0 = s_data[i0];
-    __half D1 = s_data[i1];
-    __half D2 = s_data[i2];
-    __half D3 = s_data[i3];
+    scalar_t D0 = s_data[i0];
+    scalar_t D1 = s_data[i1];
+    scalar_t D2 = s_data[i2];
+    scalar_t D3 = s_data[i3];
 
-    __half T;
+    scalar_t T;
     T = D0;
-    D0 = __hadd(D0, D2);
-    D2 = __hsub(T, D2);
+    D0 = D0 + D2;
+    D2 = T - D2;
     T = D1;
-    D1 = __hadd(D1, D3);
-    D3 = __hsub(T, D3);
+    D1 = D1 + D3;
+    D3 = T - D3;
     T = D0;
-    s_data[i0] = __hadd(D0, D1);
-    s_data[i1] = __hsub(T, D1);
+    s_data[i0] = D0 + D1;
+    s_data[i1] = T - D1;
     T = D2;
-    s_data[i2] = __hadd(D2, D3);
-    s_data[i3] = __hsub(T, D3);
+    s_data[i2] = D2 + D3;
+    s_data[i3] = T - D3;
   }
 
   // Do single radix-2 stage for odd power of two
@@ -101,10 +107,10 @@ __global__ static void fwtBatch1Kernel(__half *d_Output, __half *d_Input, int lo
       int i0 = pos << 1;
       int i1 = i0 + 1;
 
-      __half D0 = s_data[i0];
-      __half D1 = s_data[i1];
-      s_data[i0] = __hadd(D0, D1);
-      s_data[i1] = __hsub(D0, D1);
+      scalar_t D0 = s_data[i0];
+      scalar_t D1 = s_data[i1];
+      s_data[i0] = D0 + D1;
+      s_data[i1] = D0 - D1;
     }
   }
 
@@ -115,16 +121,18 @@ __global__ static void fwtBatch1Kernel(__half *d_Output, __half *d_Input, int lo
   }
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////
 // Single in-global memory radix-4 Fast Walsh Transform pass
 // (for strides exceeding elementary vector size)
 ////////////////////////////////////////////////////////////////////////////////
-__global__ static void fwtBatch2Kernel(__half *d_Output, __half *d_Input, int stride) {
+template <typename scalar_t>
+__global__ static void fwtBatch2Kernel(scalar_t *d_Output, scalar_t *d_Input, int stride) {
   const int pos = blockIdx.x * blockDim.x + threadIdx.x;
   const int N = blockDim.x * gridDim.x * 4;
 
-  __half *d_Src = d_Input + blockIdx.y * N;
-  __half *d_Dst = d_Output + blockIdx.y * N;
+  scalar_t *d_Src = d_Input + blockIdx.y * N;
+  scalar_t *d_Dst = d_Output + blockIdx.y * N;
 
   int lo = pos & (stride - 1);
   int i0 = ((pos - lo) << 2) + lo;
@@ -132,37 +140,39 @@ __global__ static void fwtBatch2Kernel(__half *d_Output, __half *d_Input, int st
   int i2 = i1 + stride;
   int i3 = i2 + stride;
 
-  __half D0 = d_Src[i0];
-  __half D1 = d_Src[i1];
-  __half D2 = d_Src[i2];
-  __half D3 = d_Src[i3];
+  scalar_t D0 = d_Src[i0];
+  scalar_t D1 = d_Src[i1];
+  scalar_t D2 = d_Src[i2];
+  scalar_t D3 = d_Src[i3];
 
-  __half T;
+  scalar_t T;
   T = D0;
-  D0 = __hadd(D0, D2);
-  D2 = __hsub(T, D2);
+  D0 = D0 + D2;
+  D2 = T - D2;
   T = D1;
-  D1 = __hadd(D1, D3);
-  D3 = __hsub(T, D3);
+  D1 = D1 + D3;
+  D3 = T - D3;
 
   T = D0;
-  d_Dst[i0] = __hadd(D0, D1);
-  d_Dst[i1] = __hsub(T, D1);
+  d_Dst[i0] = D0 + D1;
+  d_Dst[i1] = T - D1;
   T = D2;
-  d_Dst[i2] = __hadd(D2, D3);
-  d_Dst[i3] = __hsub(T, D3);
+  d_Dst[i2] = D2 + D3;
+  d_Dst[i3] = T - D3;
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Single in-global memory radix-8 Fast Walsh Transform pass
 // (for strides exceeding elementary vector size)
 ////////////////////////////////////////////////////////////////////////////////
-__global__ static void fwtBatch3Kernel(__half *d_Output, __half *d_Input, int stride) {
+template <typename scalar_t>
+__global__ static void fwtBatch3Kernel(scalar_t *d_Output, scalar_t *d_Input, int stride) {
   const int pos = blockIdx.x * blockDim.x + threadIdx.x;
   const int N = blockDim.x * gridDim.x * 8;
 
-  __half *d_Src = d_Input + blockIdx.y * N;
-  __half *d_Dst = d_Output + blockIdx.y * N;
+  scalar_t *d_Src = d_Input + blockIdx.y * N;
+  scalar_t *d_Dst = d_Output + blockIdx.y * N;
 
   int lo = pos & (stride - 1);
   int i0 = ((pos - lo) << 3) + lo;
@@ -174,84 +184,86 @@ __global__ static void fwtBatch3Kernel(__half *d_Output, __half *d_Input, int st
   int i6 = i5 + stride;
   int i7 = i6 + stride;
 
-  __half D0 = d_Src[i0];
-  __half D1 = d_Src[i1];
-  __half D2 = d_Src[i2];
-  __half D3 = d_Src[i3];
-  __half D4 = d_Src[i4];
-  __half D5 = d_Src[i5];
-  __half D6 = d_Src[i6];
-  __half D7 = d_Src[i7];
+  scalar_t D0 = d_Src[i0];
+  scalar_t D1 = d_Src[i1];
+  scalar_t D2 = d_Src[i2];
+  scalar_t D3 = d_Src[i3];
+  scalar_t D4 = d_Src[i4];
+  scalar_t D5 = d_Src[i5];
+  scalar_t D6 = d_Src[i6];
+  scalar_t D7 = d_Src[i7];
 
-  __half T;
+  scalar_t T;
   T = D0;
-  D0 = __hadd(D0, D4);
-  D4 = __hsub(T, D4);
+  D0 = D0 + D4;
+  D4 = T - D4;
   T = D1;
-  D1 = __hadd(D1, D5);
-  D5 = __hsub(T, D5);
+  D1 = D1 + D5;
+  D5 = T - D5;
   T = D2;
-  D2 = __hadd(D2, D6);
-  D6 = __hsub(T, D6);
+  D2 = D2 + D6;
+  D6 = T - D6;
   T = D3;
-  D3 = __hadd(D3, D7);
-  D7 = __hsub(T, D7);
+  D3 = D3 + D7;
+  D7 = T - D7;
 
   T = D0;
-  __half E0 = __hadd(D0, D2);
-  __half E2 = __hsub(T, D2);
+  scalar_t E0 = D0 + D2;
+  scalar_t E2 = T - D2;
   T = D1;
-  __half E1 = __hadd(D1, D3);
-  __half E3 = __hsub(T, D3);
+  scalar_t E1 = D1 + D3;
+  scalar_t E3 = T - D3;
   T = D4;
-  __half E4 = __hadd(D4, D6);
-  __half E6 = __hsub(T, D6);
+  scalar_t E4 = D4 + D6;
+  scalar_t E6 = T - D6;
   T = D5;
-  __half E5 = __hadd(D5, D7);
-  __half E7 = __hsub(T, D7);
+  scalar_t E5 = D5 + D7;
+  scalar_t E7 = T - D7;
 
   T = E0;
-  d_Dst[i0] = __hadd(E0, E1);
-  d_Dst[i1] = __hsub(T, E1);
+  d_Dst[i0] = E0 + E1;
+  d_Dst[i1] = T - E1;
   T = E2;
-  d_Dst[i2] = __hadd(E2, E3);
-  d_Dst[i3] = __hsub(T, E3);
+  d_Dst[i2] = E2 + E3;
+  d_Dst[i3] = T - E3;
   T = E4;
-  d_Dst[i4] = __hadd(E4, E5);
-  d_Dst[i5] = __hsub(T, E5);
+  d_Dst[i4] = E4 + E5;
+  d_Dst[i5] = T - E5;
   T = E6;
-  d_Dst[i6] = __hadd(E6, E7);
-  d_Dst[i7] = __hsub(T, E7);
+  d_Dst[i6] = E6 + E7;
+  d_Dst[i7] = T - E7;
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Put everything together: batched Fast Walsh Transform CPU front-end
 ////////////////////////////////////////////////////////////////////////////////
-__host__ extern void fwtBatchGPU(__half *d_Data, size_t M, int log2N) {
-  const int THREAD_N = 256;
-  at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+__host__ extern void fwtBatchGPU(torch::Tensor& d_Data, size_t M, int log2N) {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(d_Data.scalar_type(), "fwtBatchGPU", [&] {
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    int scalar_type_log2size = log2(sizeof(scalar_t));
+    scalar_t *data_ptr = d_Data.data_ptr<scalar_t>();
 
-  int N = 1 << log2N;
-  dim3 grid((1 << log2N) / (8 * THREAD_N), M, 1);
+    int N = 1 << log2N;
+    const int THREAD_N = 256;
+    dim3 grid(N / (8 * THREAD_N), M, 1);
 
-  for (; log2N > ELEMENTARY_LOG2SIZE; log2N -= 3, N >>= 3, M <<= 3) {
-    fwtBatch3Kernel<<<grid, THREAD_N, 0, stream>>>(d_Data, d_Data, N / 8);
-    getLastCudaError("fwtBatch2Kernel() execution failed\n");
-  }
+    for (; log2N > MAX_SMEM_LOG2SIZE + scalar_type_log2size; log2N -= 3, N >>= 3, M <<= 3) {
+      fwtBatch3Kernel<<<grid, THREAD_N, 0, stream>>>(data_ptr, data_ptr, N / 8);
+      getLastCudaError("fwtBatch2Kernel() execution failed\n");
+    }
 
-  for (; log2N > ELEMENTARY_LOG2SIZE; log2N -= 2, N >>= 2, M <<= 2) {
-    fwtBatch2Kernel<<<grid, THREAD_N, 0, stream>>>(d_Data, d_Data, N / 4);
-    getLastCudaError("fwtBatch2Kernel() execution failed\n");
-  }
-
-  fwtBatch1Kernel<<<M, N / 4, N * sizeof(__half), stream>>>(d_Data, d_Data, log2N);
-  getLastCudaError("fwtBatch1Kernel() execution failed\n");
+    fwtBatch1Kernel<<<M, N / 4, N * sizeof(scalar_t), stream>>>(data_ptr, data_ptr, log2N);
+    getLastCudaError("fwtBatch1Kernel() execution failed\n");
+  });
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Modulate two arrays
 ////////////////////////////////////////////////////////////////////////////////
-__global__ static void modulateKernel(__half *d_A, __half *d_B, int N) {
+template <typename scalar_t>
+__global__ static void modulateKernel(scalar_t *d_A, scalar_t *d_B, int N) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int numThreads = blockDim.x * gridDim.x;
 
@@ -260,8 +272,10 @@ __global__ static void modulateKernel(__half *d_A, __half *d_B, int N) {
   }
 }
 
+
 // Interface to modulateKernel()
-__host__ extern void modulateGPU(__half *d_A, __half *d_B, int N) {
+template <typename scalar_t>
+__host__ extern void modulateGPU(scalar_t *d_A, scalar_t *d_B, int N) {
   modulateKernel<<<128, 256>>>(d_A, d_B, N);
 }
 

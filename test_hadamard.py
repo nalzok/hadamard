@@ -1,10 +1,6 @@
 import torch
-from scipy.linalg import hadamard
 
 from hadamard import hadamard_transform_torch, hadamard_transform_cuda
-
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class Repeat:
@@ -52,40 +48,26 @@ class Benchmark:
 
 
 def test_hadamard_transform():
-    m = 10
+    dtype = torch.float16
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    m = 12
     n = 1 << m
-    batch_size = 1 << 0
-    u = torch.rand((batch_size, n), dtype=torch.float16, device=device)
+    batch_size = 1 << 10
+    u = torch.rand((batch_size, n), dtype=dtype, device=device)
 
     dummy = torch.clone(u)
-    with Benchmark("Torch (loop)"):
-        for _ in range(1024):
-            dummy = hadamard_transform_torch(dummy)
-
-    with Repeat(hadamard_transform_torch, u, 1024) as (g, result):
-        with Benchmark("Torch (graph)"):
-            g.replay()
-        result_torch = torch.clone(result)
+    with Benchmark("Torch"):
+        result_torch = hadamard_transform_torch(dummy)
 
     dummy = torch.clone(u)
-    with Benchmark("CUDA (loop)"):
-        for _ in range(1024):
-            dummy = hadamard_transform_cuda(dummy)
-    
-    with Repeat(hadamard_transform_cuda, u, 1024) as (g, result):
-        with Benchmark("CUDA (graph)"):
-            g.replay()
-        result_cuda = torch.clone(result)
+    with Benchmark("CUDA"):
+        result_cuda = hadamard_transform_cuda(dummy)
 
-    # Explicit construction from scipy
-    # H = torch.tensor(hadamard(n), dtype=torch.float16, device=device)
-    # result_explicit = u @ H.t()
-    # print("---------")
-    # print("[Torch] L-inf", (result_torch - result_explicit).abs().max().item())
-    # print("[Torch] L-1", (result_torch - result_explicit).abs().mean().item())
-    # print("[CUDA ] L-inf", (result_cuda - result_explicit).abs().max().item())
-    # print("[CUDA ] L-1", (result_cuda - result_explicit).abs().mean().item())
+    print("Error (L-inf):", (result_torch - result_cuda).abs().max().item())
+    print("Error (L-1):", (result_torch - result_cuda).abs().mean().item())
 
 
 if __name__ == '__main__':
+    torch.random.manual_seed(42)
     test_hadamard_transform()
