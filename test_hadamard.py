@@ -48,24 +48,25 @@ class Benchmark:
 
 
 def test_hadamard_transform():
-    dtype = torch.float16
+    dtype = torch.float64
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    m = 12
-    n = 1 << m
-    batch_size = 1 << 10
-    u = torch.rand((batch_size, n), dtype=dtype, device=device)
+    for m in range(20):
+        print(f"{m = }")
 
-    dummy = torch.clone(u)
-    with Benchmark("Torch"):
-        result_torch = hadamard_transform_torch(dummy)
+        n = 1 << m
+        batch_size = 1 << 2
+        u = torch.rand((batch_size, n), dtype=dtype, device=device)
+        u = torch.arange(batch_size * n, dtype=dtype, device=device).reshape(batch_size, n)
 
-    dummy = torch.clone(u)
-    with Benchmark("CUDA"):
-        result_cuda = hadamard_transform_cuda(dummy)
+        with Benchmark("Torch"):
+            result_torch = hadamard_transform_torch(u)
 
-    print("Error (L-inf):", (result_torch - result_cuda).abs().max().item())
-    print("Error (L-1):", (result_torch - result_cuda).abs().mean().item())
+        with Benchmark("CUDA"):
+            result_cuda = hadamard_transform_cuda(u)
+
+        print("Error (L-inf):", (result_torch - result_cuda).abs().max().item())
+        print("Error (L-1):", (result_torch - result_cuda).abs().mean().item())
 
 
 if __name__ == '__main__':

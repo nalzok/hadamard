@@ -40,6 +40,20 @@
 #include <ATen/Dispatch.h>
 #include <torch/types.h>
 
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+  if (code != cudaSuccess)
+  {
+    fprintf(stderr, "GPUassert[%s:%d]: %s\n", file, line, cudaGetErrorString(code));
+    if (abort) exit(code);
+  }
+}
+
+// roundup(x, y) is equal to x rounded up to the nearest multiple of y.
+__device__ static inline int roundup(int x, int y) {
+  return y * ((x + y - 1) / y);
+}
 
 namespace cg = cooperative_groups;
 
@@ -51,114 +65,90 @@ namespace cg = cooperative_groups;
 
 
 template <typename scalar_t>
-__global__ static void fwtBatch1Kernel(scalar_t *d_Output, scalar_t *d_Input, int log2N) {
+__global__ static void fwtBatch1Kernel(scalar_t *d_Output, scalar_t *d_Input, int batchSize, int vecSize) {
   // Handle to thread block group
   cg::thread_block cta = cg::this_thread_block();
-  const int N = 1 << log2N;
-  const int base = blockIdx.x << log2N;
 
   // 2 ** 13 bytes == 8KB -- maximum s_data[] size for A6000
   extern __shared__ __align__(8) unsigned char sdata_raw[];     // align to 8 bytes for double
   scalar_t *s_data = reinterpret_cast<scalar_t*>(sdata_raw);
 
-  scalar_t *d_Src = d_Input + base;
-  scalar_t *d_Dst = d_Output + base;
+  for (int batch = blockIdx.x; batch < roundup(batchSize, gridDim.x); batch += gridDim.x) {
+    if (batch >= batchSize) {
+      for (int stride = vecSize >> 2; stride > 0; stride >>= 2) {
+        cg::sync(cta);
+      }
+      if (__popc(vecSize - 1) % 2 == 1) {
+        cg::sync(cta);
+      }
+      cg::sync(cta);
+      break;
+    }
 
-  for (int pos = threadIdx.x; pos < N; pos += blockDim.x) {
-    s_data[pos] = d_Src[pos];
-  }
+    scalar_t *d_Src = d_Input + batch * vecSize;
+    scalar_t *d_Dst = d_Output + batch * vecSize;
 
-  // Main radix-4 stages
-  const int pos = threadIdx.x;
+    for (int pos = threadIdx.x; pos < vecSize; pos += blockDim.x) {
+      s_data[pos] = d_Src[pos];
+    }
 
-  for (int stride = N >> 2; stride > 0; stride >>= 2) {
-    int lo = pos & (stride - 1);
-    int i0 = ((pos - lo) << 2) + lo;
-    int i1 = i0 + stride;
-    int i2 = i1 + stride;
-    int i3 = i2 + stride;
+    // Main radix-4 stages
+    for (int stride = vecSize >> 2; stride > 0; stride >>= 2) {
+      for (int pos = threadIdx.x; pos < roundup(vecSize/4, blockDim.x); pos += blockDim.x) {
+        if (pos >= vecSize/4) {
+          cg::sync(cta);
+          break;
+        }
+
+        int lo = pos & (stride - 1);
+        int i0 = ((pos - lo) << 2) + lo;
+        int i1 = i0 + stride;
+        int i2 = i1 + stride;
+        int i3 = i2 + stride;
+
+        cg::sync(cta);
+        scalar_t D0 = s_data[i0];
+        scalar_t D1 = s_data[i1];
+        scalar_t D2 = s_data[i2];
+        scalar_t D3 = s_data[i3];
+
+        scalar_t T;
+        T = D0;
+        D0 = D0 + D2;
+        D2 = T - D2;
+        T = D1;
+        D1 = D1 + D3;
+        D3 = T - D3;
+        T = D0;
+        s_data[i0] = D0 + D1;
+        s_data[i1] = T - D1;
+        T = D2;
+        s_data[i2] = D2 + D3;
+        s_data[i3] = T - D3;
+      }
+    }
+
+    // Do single radix-2 stage for odd power of two
+    if (__popc(vecSize - 1) % 2 == 1) {
+      cg::sync(cta);
+
+      for (int pos = threadIdx.x; pos < vecSize/2; pos += blockDim.x) {
+        int i0 = pos << 1;
+        int i1 = i0 + 1;
+
+        scalar_t D0 = s_data[i0];
+        scalar_t D1 = s_data[i1];
+        s_data[i0] = D0 + D1;
+        s_data[i1] = D0 - D1;
+      }
+    }
 
     cg::sync(cta);
-    scalar_t D0 = s_data[i0];
-    scalar_t D1 = s_data[i1];
-    scalar_t D2 = s_data[i2];
-    scalar_t D3 = s_data[i3];
 
-    scalar_t T;
-    T = D0;
-    D0 = D0 + D2;
-    D2 = T - D2;
-    T = D1;
-    D1 = D1 + D3;
-    D3 = T - D3;
-    T = D0;
-    s_data[i0] = D0 + D1;
-    s_data[i1] = T - D1;
-    T = D2;
-    s_data[i2] = D2 + D3;
-    s_data[i3] = T - D3;
-  }
-
-  // Do single radix-2 stage for odd power of two
-  if (log2N & 1) {
-    cg::sync(cta);
-
-    for (int pos = threadIdx.x; pos < N / 2; pos += blockDim.x) {
-      int i0 = pos << 1;
-      int i1 = i0 + 1;
-
-      scalar_t D0 = s_data[i0];
-      scalar_t D1 = s_data[i1];
-      s_data[i0] = D0 + D1;
-      s_data[i1] = D0 - D1;
+    for (int pos = threadIdx.x; pos < vecSize; pos += blockDim.x) {
+      d_Dst[pos] = s_data[pos];
     }
   }
-
-  cg::sync(cta);
-
-  for (int pos = threadIdx.x; pos < N; pos += blockDim.x) {
-    d_Dst[pos] = s_data[pos];
-  }
-}
-
-
-////////////////////////////////////////////////////////////////////////////////
-// Single in-global memory radix-4 Fast Walsh Transform pass
-// (for strides exceeding elementary vector size)
-////////////////////////////////////////////////////////////////////////////////
-template <typename scalar_t>
-__global__ static void fwtBatch2Kernel(scalar_t *d_Output, scalar_t *d_Input, int stride) {
-  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
-  const int N = blockDim.x * gridDim.x * 4;
-
-  scalar_t *d_Src = d_Input + blockIdx.y * N;
-  scalar_t *d_Dst = d_Output + blockIdx.y * N;
-
-  int lo = pos & (stride - 1);
-  int i0 = ((pos - lo) << 2) + lo;
-  int i1 = i0 + stride;
-  int i2 = i1 + stride;
-  int i3 = i2 + stride;
-
-  scalar_t D0 = d_Src[i0];
-  scalar_t D1 = d_Src[i1];
-  scalar_t D2 = d_Src[i2];
-  scalar_t D3 = d_Src[i3];
-
-  scalar_t T;
-  T = D0;
-  D0 = D0 + D2;
-  D2 = T - D2;
-  T = D1;
-  D1 = D1 + D3;
-  D3 = T - D3;
-
-  T = D0;
-  d_Dst[i0] = D0 + D1;
-  d_Dst[i1] = T - D1;
-  T = D2;
-  d_Dst[i2] = D2 + D3;
-  d_Dst[i3] = T - D3;
 }
 
 
@@ -167,94 +157,101 @@ __global__ static void fwtBatch2Kernel(scalar_t *d_Output, scalar_t *d_Input, in
 // (for strides exceeding elementary vector size)
 ////////////////////////////////////////////////////////////////////////////////
 template <typename scalar_t>
-__global__ static void fwtBatch3Kernel(scalar_t *d_Output, scalar_t *d_Input, int stride) {
-  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
-  const int N = blockDim.x * gridDim.x * 8;
+__global__ static void fwtBatch3Kernel(scalar_t *d_Output, scalar_t *d_Input, int batchSize, int vecSize, int stride) {
+  const int tidY = blockIdx.y * blockDim.y + threadIdx.y;
+  for (int batch = tidY; batch < batchSize; batch += blockDim.y * gridDim.y) {
+    scalar_t *d_Src = d_Input + batch * vecSize;
+    scalar_t *d_Dst = d_Output + batch * vecSize;
 
-  scalar_t *d_Src = d_Input + blockIdx.y * N;
-  scalar_t *d_Dst = d_Output + blockIdx.y * N;
+    const int tidX = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int pos = tidX; pos < vecSize/8; pos += blockDim.x * gridDim.x) {
+      int lo = pos & (stride - 1);
+      int i0 = ((pos - lo) << 3) + lo;
+      int i1 = i0 + stride;
+      int i2 = i1 + stride;
+      int i3 = i2 + stride;
+      int i4 = i3 + stride;
+      int i5 = i4 + stride;
+      int i6 = i5 + stride;
+      int i7 = i6 + stride;
 
-  int lo = pos & (stride - 1);
-  int i0 = ((pos - lo) << 3) + lo;
-  int i1 = i0 + stride;
-  int i2 = i1 + stride;
-  int i3 = i2 + stride;
-  int i4 = i3 + stride;
-  int i5 = i4 + stride;
-  int i6 = i5 + stride;
-  int i7 = i6 + stride;
+      scalar_t D0 = d_Src[i0];
+      scalar_t D1 = d_Src[i1];
+      scalar_t D2 = d_Src[i2];
+      scalar_t D3 = d_Src[i3];
+      scalar_t D4 = d_Src[i4];
+      scalar_t D5 = d_Src[i5];
+      scalar_t D6 = d_Src[i6];
+      scalar_t D7 = d_Src[i7];
 
-  scalar_t D0 = d_Src[i0];
-  scalar_t D1 = d_Src[i1];
-  scalar_t D2 = d_Src[i2];
-  scalar_t D3 = d_Src[i3];
-  scalar_t D4 = d_Src[i4];
-  scalar_t D5 = d_Src[i5];
-  scalar_t D6 = d_Src[i6];
-  scalar_t D7 = d_Src[i7];
+      scalar_t T;
+      T = D0;
+      D0 = D0 + D4;
+      D4 = T - D4;
+      T = D1;
+      D1 = D1 + D5;
+      D5 = T - D5;
+      T = D2;
+      D2 = D2 + D6;
+      D6 = T - D6;
+      T = D3;
+      D3 = D3 + D7;
+      D7 = T - D7;
 
-  scalar_t T;
-  T = D0;
-  D0 = D0 + D4;
-  D4 = T - D4;
-  T = D1;
-  D1 = D1 + D5;
-  D5 = T - D5;
-  T = D2;
-  D2 = D2 + D6;
-  D6 = T - D6;
-  T = D3;
-  D3 = D3 + D7;
-  D7 = T - D7;
+      T = D0;
+      scalar_t E0 = D0 + D2;
+      scalar_t E2 = T - D2;
+      T = D1;
+      scalar_t E1 = D1 + D3;
+      scalar_t E3 = T - D3;
+      T = D4;
+      scalar_t E4 = D4 + D6;
+      scalar_t E6 = T - D6;
+      T = D5;
+      scalar_t E5 = D5 + D7;
+      scalar_t E7 = T - D7;
 
-  T = D0;
-  scalar_t E0 = D0 + D2;
-  scalar_t E2 = T - D2;
-  T = D1;
-  scalar_t E1 = D1 + D3;
-  scalar_t E3 = T - D3;
-  T = D4;
-  scalar_t E4 = D4 + D6;
-  scalar_t E6 = T - D6;
-  T = D5;
-  scalar_t E5 = D5 + D7;
-  scalar_t E7 = T - D7;
-
-  T = E0;
-  d_Dst[i0] = E0 + E1;
-  d_Dst[i1] = T - E1;
-  T = E2;
-  d_Dst[i2] = E2 + E3;
-  d_Dst[i3] = T - E3;
-  T = E4;
-  d_Dst[i4] = E4 + E5;
-  d_Dst[i5] = T - E5;
-  T = E6;
-  d_Dst[i6] = E6 + E7;
-  d_Dst[i7] = T - E7;
+      T = E0;
+      d_Dst[i0] = E0 + E1;
+      d_Dst[i1] = T - E1;
+      T = E2;
+      d_Dst[i2] = E2 + E3;
+      d_Dst[i3] = T - E3;
+      T = E4;
+      d_Dst[i4] = E4 + E5;
+      d_Dst[i5] = T - E5;
+      T = E6;
+      d_Dst[i6] = E6 + E7;
+      d_Dst[i7] = T - E7;
+    }
+  }
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////
 // Put everything together: batched Fast Walsh Transform CPU front-end
 ////////////////////////////////////////////////////////////////////////////////
-__host__ extern void fwtBatchGPU(torch::Tensor& d_Data, size_t M, int log2N) {
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(d_Data.scalar_type(), "fwtBatchGPU", [&] {
+__host__ extern void fwtBatchGPU(torch::Tensor& d_Data, int batchSize, int log2N) {
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, d_Data.scalar_type(), "fwtBatchGPU", [&] {
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
-    int scalar_type_log2size = log2(sizeof(scalar_t));
     scalar_t *data_ptr = d_Data.data_ptr<scalar_t>();
 
-    int N = 1 << log2N;
-    const int THREAD_N = 256;
-    dim3 grid(N / (8 * THREAD_N), M, 1);
+    const int origBatchSize = batchSize;
+    const int origVecSize = 1 << log2N;
 
-    for (; log2N > MAX_SMEM_LOG2SIZE + scalar_type_log2size; log2N -= 3, N >>= 3, M <<= 3) {
-      fwtBatch3Kernel<<<grid, THREAD_N, 0, stream>>>(data_ptr, data_ptr, N / 8);
-      getLastCudaError("fwtBatch2Kernel() execution failed\n");
+    dim3 dimGrid(128, 2, 1);
+    dim3 dimBlock(256, 2, 1);
+
+    int vecSize = origVecSize;
+    for (; vecSize * sizeof(scalar_t) > (1 << MAX_SMEM_LOG2SIZE); batchSize <<= 3, vecSize >>= 3) {
+      fwtBatch3Kernel<<<dimGrid, dimBlock, 0, stream>>>(data_ptr, data_ptr, origBatchSize, origVecSize, vecSize/8);
+      gpuErrchk(cudaPeekAtLastError());
+      gpuErrchk(cudaDeviceSynchronize());
     }
 
-    fwtBatch1Kernel<<<M, N / 4, N * sizeof(scalar_t), stream>>>(data_ptr, data_ptr, log2N);
-    getLastCudaError("fwtBatch1Kernel() execution failed\n");
+    fwtBatch1Kernel<<<128, std::min(std::max(1, vecSize/4), 256), vecSize * sizeof(scalar_t), stream>>>(data_ptr, data_ptr, batchSize, vecSize);
+    gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaDeviceSynchronize());
   });
 }
 
@@ -268,15 +265,16 @@ __global__ static void modulateKernel(scalar_t *d_A, scalar_t *d_B, int N) {
   int numThreads = blockDim.x * gridDim.x;
 
   for (int pos = tid; pos < N; pos += numThreads) {
-    d_A[pos] = __hmul(d_A[pos], __hdiv(d_B[pos], __int2half_rn(N)));
+    d_A[pos] *= d_B[pos] / N;
   }
 }
 
 
 // Interface to modulateKernel()
-template <typename scalar_t>
-__host__ extern void modulateGPU(scalar_t *d_A, scalar_t *d_B, int N) {
-  modulateKernel<<<128, 256>>>(d_A, d_B, N);
+__host__ extern void modulateGPU(torch::Tensor &d_A, torch::Tensor &d_B, int N) {
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, d_A.scalar_type(), "fwtBatchGPU", [&] {
+    modulateKernel<<<128, 256>>>(d_A.data_ptr<scalar_t>(), d_B.data_ptr<scalar_t>(), N);
+  });
 }
 
 #endif

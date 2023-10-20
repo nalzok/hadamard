@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 
 
-extern void fwtBatchGPU(torch::Tensor& x, size_t batchSize, int log2N);
+extern void fwtBatchGPU(torch::Tensor& x, int batchSize, int log2N);
 
 torch::Tensor hadamard_transform(torch::Tensor x) {
   TORCH_CHECK(x.device().type() == torch::kCUDA, "x must be a CUDA tensor");
@@ -10,7 +10,7 @@ torch::Tensor hadamard_transform(torch::Tensor x) {
   auto log2N = long(log2(n));
   TORCH_CHECK(n == 1 << log2N, "n must be a power of 2");
   auto output = x.clone();  // Cloning makes it contiguous.
-  auto batchSize = x.numel() / (1 << log2N);
+  auto batchSize = x.numel() >> log2N;
   fwtBatchGPU(output, batchSize, log2N);
   return output;
 }
