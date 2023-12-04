@@ -31,8 +31,10 @@ class Repeat:
 
 
 class Benchmark:
-    def __init__(self, name):
+    def __init__(self, dtype, name, show):
+        self.dtype = dtype
         self.name = name
+        self.show = show
         self.start_event = torch.cuda.Event(enable_timing=True)
         self.end_event = torch.cuda.Event(enable_timing=True)
 
@@ -44,29 +46,34 @@ class Benchmark:
         self.end_event.record()
         torch.cuda.synchronize()
         elapsed_time_ms = self.start_event.elapsed_time(self.end_event)
-        print(f"[{self.name.ljust(16)}] Elapsed: ", elapsed_time_ms)
+        if self.show:
+            print(self.dtype, f"[{self.name.ljust(8)}] Elapsed: {elapsed_time_ms:.4f}ms")
 
 
 def test_hadamard_transform():
-    dtype = torch.float64
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
 
-    for m in range(20):
-        print(f"{m = }")
+    n = 1 << 13
+    batch_size = 1 << 10
+    u = torch.rand((batch_size, n), device=device)
+    ground_truth = hadamard_transform_torch(u)
 
-        n = 1 << m
-        batch_size = 1 << 2
-        u = torch.rand((batch_size, n), dtype=dtype, device=device)
-        u = torch.arange(batch_size * n, dtype=dtype, device=device).reshape(batch_size, n)
+    for dtype in [torch.float16, torch.bfloat16, torch.float32, torch.float64]:
+        print()
 
-        with Benchmark("Torch"):
-            result_torch = hadamard_transform_torch(u)
+        for i in range(3):
+            v = u.to(dtype)
 
-        with Benchmark("CUDA"):
-            result_cuda = hadamard_transform_cuda(u)
+            with Benchmark(dtype, "Torch", i == 2):
+                result_torch = hadamard_transform_torch(v)
 
-        print("Error (L-inf):", (result_torch - result_cuda).abs().max().item())
-        print("Error (L-1):", (result_torch - result_cuda).abs().mean().item())
+            with Benchmark(dtype, "CUDA", i == 2):
+                result_cuda = hadamard_transform_cuda(v)
+
+            if i == 2:
+                error = (result_cuda - ground_truth).abs().double()
+                print(dtype, "Error (L-inf):", error.max().item())
+                print(dtype, "Error (L-1):", error.mean().item())
 
 
 if __name__ == '__main__':
