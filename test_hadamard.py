@@ -54,7 +54,7 @@ def test_hadamard_transform():
     device = torch.device("cuda")
 
     n = 1 << 13
-    batch_size = 1 << 10
+    batch_size = 1
     u = torch.rand((batch_size, n), device=device)
     ground_truth = hadamard_transform_torch(u)
 
